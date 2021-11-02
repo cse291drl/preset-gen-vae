@@ -24,7 +24,8 @@ import pandas as pd
 import pathlib
 #import pkgutil
 
-import librenderman as rm  # A symbolic link to the actual librenderman.so must be found in the current folder
+import dawdreamer as daw    # Replaces Renderman
+import sounddevice as sd
 
 
 # Pickled numpy arrays storage in sqlite3 DB
@@ -78,7 +79,7 @@ class PresetDatabase:
         self.all_presets_df.drop(columns='pickled_params_np_array', inplace=True)
         # Algorithms are also separately stored
         self._preset_algos = self.presets_mat[:, 4]
-        self._preset_algos = np.asarray(np.round(1.0 + self._preset_algos * 31.0), dtype=np.int)
+        self._preset_algos = np.asarray(np.round(1.0 + self._preset_algos * 31.0), dtype=int)
         # We also pre-load the names in order to close the sqlite DB
         names_df = pd.read_sql_query("SELECT * FROM param ORDER BY index_param", conn)
         self._param_names = names_df['name'].to_list()
@@ -215,40 +216,90 @@ class PresetDatabase:
 
 
 class Dexed:
-    """ A Dexed (DX7) synth that can be used through RenderMan for offline wav rendering. """
+    """ A Dexed (DX7) synth that can be used through DawDreamer for 
+    offline wav rendering. 
+    
+    Attributes:
+        plugin_path: The path to the plugin. Defaults to Dexed.dll in 
+            preset-gen-vae parent dir.
+        midi_note_duration: The number of seconds to hold the note.
+        render_duration: The number of seconds to render the wav.
+        sample_rate (int): The sample rate of the wav. Defaults to librosa 
+            default 22050.
+        buffer_size (int): Block size for DawDreamer rendering audio.
+        fadeout_duration_s (float): The number of seconds to fadeout with
+            end of the wav to reduce STFT discontinuities with long-release 
+            presets.
+    """
 
-    def __init__(self, plugin_path="/home/gwendal/Jupyter/AudioPlugins/Dexed.so",
-                 midi_note_duration_s=3.0, render_duration_s=4.0,
-                 sample_rate=22050,  # librosa default sr
-                 buffer_size=512, fft_size=512,
+    def __init__(self, plugin_path=os.path.join('..', '..', 'Dexed.dll'),
+                 midi_note_duration_s=3, render_duration_s=4,
+                 sample_rate=22050, buffer_size=16384*8, 
                  fadeout_duration_s=0.1):
-        self.fadeout_duration_s = fadeout_duration_s  # To reduce STFT discontinuities with long-release presets
+        self.plugin_path = plugin_path
         self.midi_note_duration_s = midi_note_duration_s
         self.render_duration_s = render_duration_s
-
-        self.plugin_path = plugin_path
         self.Fs = sample_rate
         self.buffer_size = buffer_size
-        self.fft_size = fft_size  # FFT not used
+        self.fadeout_duration_s = fadeout_duration_s 
 
-        self.engine = rm.RenderEngine(self.Fs, self.buffer_size, self.fft_size)
-        self.engine.load_plugin(self.plugin_path)
-
-        # A generator preset is a list of (int, float) tuples.
-        self.preset_gen = rm.PatchGenerator(self.engine)  # 'RenderMan' generator
+        # Create the engine and synth
+        self.engine = daw.RenderEngine(self.Fs, self.buffer_size)
+        self.synth = self.engine.make_plugin_processor("dexed", self.plugin_path)
         self.current_preset = None
 
+        # Get info about initial synth params
+        self.n_params = self.synth.get_plugin_parameter_size()
+        self.params = np.zeros(self.n_params, dtype=np.float32)
+        self.param_names = np.empty(self.n_params, dtype="S20")
+
+        for i in range(self.n_params):
+            self.param_names[i] = self.synth.get_parameter_name(i)
+            self.params[i] = self.synth.get_parameter(i)
+
+        self.param_names = self.param_names.astype(str)
+        
     def __str__(self):
         return "Plugin loaded from {}, Fs={}Hz, buffer {} samples."\
                "MIDI note on duration: {:.1f}s / {:.1f}s total."\
             .format(self.plugin_path, self.Fs, self.buffer_size,
                     self.midi_note_duration_s, self.render_duration_s)
 
+    def get_current_params(self):
+        """Updates self.params to match vst state and returns the current 
+        values of the synth parameters."""
+        for i in range(self.n_params):
+            self.params[i] = self.synth.get_parameter(i)
+        return self.params
+
+    def param_desc_str(self):
+        """Returns a string describing the parameters of the synth."""
+        self.get_current_params()
+        return '\n'.join(
+            ['{:<5d}{:<21s}{}'.format(i, self.param_names[i], self.params[i]) 
+                for i in range(self.n_params)]
+        )
+
     def render_note(self, midi_note, midi_velocity, normalize=False):
-        """ Renders a midi note (for the currently set patch) and returns the normalized float array. """
-        self.engine.render_patch(midi_note, midi_velocity, self.midi_note_duration_s, self.render_duration_s)
-        audio_out = self.engine.get_audio_frames()
-        audio = np.asarray(audio_out)
+        """ Renders a midi note (for the currently set patch) 
+        and returns the float array (possibly normalized). 
+        """
+        # Add note to synth
+        dexed.synth.clear_midi()
+        dexed.synth.add_midi_note(
+            midi_note, 
+            midi_velocity, 
+            0.0, # note start time
+            self.midi_note_duration_s)
+
+        # Render audio
+        dexed.engine.load_graph([(dexed.synth, [])])
+        dexed.engine.render(dexed.render_duration_s)
+        stereo_audio = dexed.engine.get_audio()
+        audio = stereo_audio.mean(axis=0)
+        dexed.synth.clear_midi()
+
+        # Fadeout and normalize
         fadeout_len = int(np.floor(self.Fs * self.fadeout_duration_s))
         if fadeout_len > 1:  # fadeout might be disabled if too short
             fadeout = np.linspace(1.0, 0.0, fadeout_len)
@@ -258,53 +309,59 @@ class Dexed:
         else:
             return audio
 
-    def render_note_to_file(self, midi_note, midi_velocity, filename="./dexed_output.wav"):
+    def render_note_to_file(self, midi_note, midi_velocity, 
+                            filename="./dexed_output.wav", normalize=False):
         """ Renders a midi note (for the currently set patch), normalizes it and stores it
-        to a 16-bit PCM wav file. """
-        assert False  # deprecated function
-        self.engine.render_patch(midi_note, midi_velocity, self.midi_note_duration_s, self.render_duration_s)
-        # RenderMan wav writing is broken - using scipy instead
-        audio_out = self.engine.get_audio_frames()
-        audio = np.asarray(audio_out)
-        max_amplitude = np.abs(audio).max()
-        audio = ((2**15 - 1) / max_amplitude) * audio
-        audio = np.array(np.round(audio), dtype=np.int16)
+        to a 32-bit float wav file. 
+        """
+        audio = self.render_note(midi_note, midi_velocity, normalize=normalize)
         wavfile.write(filename, self.Fs, audio)
+        return audio
+
+    def set_param(self, param_idx, value):
+        """Sets the value of a synth parameter by index.
+
+        Args:
+            param_idx (int): The index of the parameter to set.
+            value (float): The value to set the parameter to.
+        """
+        self.synth.set_parameter(param_idx, value)
+
+    def set_param_by_name(self, param_name, value):
+        """Sets the value of a synth parameter by name.
+
+        Args:
+            param_name (str): The name of the parameter to set.
+            value (float): The value to set the parameter to.
+        """
+        param_idx = np.where(self.param_names == param_name)[0]
+        self.set_param(param_idx, value)
+        
+    def set_param_array(self, params):
+        """Sets synth parameters to be given params array.
+
+        Args:
+            params (list-like): A list-like of values to set the 
+                synth parameters with corresponding indices to.
+        """
+        for i in range(self.n_params):
+            self.synth.set_parameter(i, params[i])
 
     def assign_preset(self, preset):
         """ :param preset: List of tuples (param_idx, param_value) """
-        self.current_preset = preset
-        self.engine.set_patch(self.current_preset)
-
-    def assign_random_preset_short_release(self):
-        """ Generates a random preset with a short release time - to ensure a limited-duration
-         audio recording, and configures the rendering engine to use that preset. """
-        self.current_preset = dexed.preset_gen.get_random_patch()
-        self.set_release_short()
-        self.engine.set_patch(self.current_preset)
-
-    def set_release_short(self, eg_4_rate_min=0.5):
-        assert False  # deprecated - should return the modified params as well
-        for i, param in enumerate(self.current_preset):
-            idx, value = param  # a param is actually a tuple...
-            # Envelope release level: always to zero (or would be an actual hanging note)
-            if idx == 30 or idx == 52 or idx == 74 or idx == 96 or idx == 118 or idx == 140:
-                self.current_preset[i] = (idx, 0.0)
-            # Envelope release time: quite short (higher float value: shorter release)
-            elif idx == 26 or idx == 48 or idx == 70 or idx == 92 or idx == 114 or idx == 136:
-                self.current_preset[i] = (idx, max(eg_4_rate_min, value))
-        self.engine.set_patch(self.current_preset)
+        for param_idx, param_value in preset:
+            self.set_param(param_idx, param_value)
 
     def set_default_general_filter_and_tune_params(self):
-        """ Internally sets the modified preset, and returns the list of parameter values. """
-        assert self.current_preset is not None
-        self.current_preset[0] = (0, 1.0)  # filter cutoff
-        self.current_preset[1] = (1, 0.0)  # filter reso
-        self.current_preset[2] = (2, 1.0)  # output vol
-        self.current_preset[3] = (3, 0.5)  # master tune
-        self.current_preset[13] = (13, 0.5)  # Sets the 'middle-C' note to the default C3 value
-        self.engine.set_patch(self.current_preset)
-        return [v for _, v in self.current_preset]
+        """ Internally sets the modified preset, and returns the array of 
+        updated parameter values. """
+        self.set_param(0, 1.0)  # filter cutoff
+        self.set_param(1, 0.0)  # filter resonance
+        self.set_param(2, 1.0)  # output vol
+        self.set_param(3, 0.5)  # master tune
+        self.set_param(13, 0.5)  # middle-C to default C3
+
+        return self.get_current_params()
 
     @staticmethod
     def set_default_general_filter_and_tune_params_(preset_params):
@@ -312,12 +369,11 @@ class Dexed:
         preset_params[[0, 1, 2, 3, 13]] = np.asarray([1.0, 0.0, 1.0, 0.5, 0.5])
 
     def set_all_oscillators_on(self):
-        """ Internally sets the modified preset, and returns the list of parameter values. """
-        assert self.current_preset is not None
+        """ Internally sets the modified preset, and returns the arraty of 
+        updated parameter values. """
         for idx in [44, 66, 88, 110, 132, 154]:
-            self.current_preset[idx] = (idx, 1.0)
-        self.engine.set_patch(self.current_preset)
-        return [v for _, v in self.current_preset]
+            self.set_param(idx, 1.0)
+        return self.get_current_params()
 
     @staticmethod
     def set_all_oscillators_on_(preset_params):
@@ -340,15 +396,16 @@ class Dexed:
         """
         Dexed.set_all_oscillators_off_(preset_params)
         for op_number in operators_to_turn_on:
-            preset_params[44 + 22 * (op_number-1)] = 1.0
+            self.set_param(44 + 22 * (op_number-1), 1.0)
 
     def prevent_SH_LFO(self):
-        """ If the LFO Wave is random S&H, transforms it into a square LFO wave to get deterministic
-        results. Internally sets the modified preset, and returns the list of parameter values.  """
-        if self.current_preset[12][1] > 0.95:  # S&H wave corresponds to a 1.0 param value
-            self.current_preset[12] = (12, 4.0 / 5.0)  # Square wave is number 4/6
-        self.engine.set_patch(self.current_preset)
-        return [v for _, v in self.current_preset]
+        """ If the LFO Wave is random S&H, transforms it into a square 
+        LFO wave to get deterministic results. Internally sets the modified 
+        preset, and returns the array of parameter values.  
+        """
+        if self.synth.get_parameter(12) > 0.95:  # S&H wave corresponds to a 1.0 param value
+            self.set_param(12,  4.0 / 5.0)  # Square wave is number 4/6
+        return self.get_current_params()
 
     @staticmethod
     def prevent_SH_LFO_(preset_params):
@@ -451,8 +508,16 @@ class Dexed:
             indexes.append(44 + 22*i)  # op on/off switch
         return indexes
 
+    def play_audio(self, audio, blocking=False):
+        """ Plays audio through computer. """
+        sd.play(audio, self.Fs)
+        if blocking:
+            sd.wait()
+
+
 
 if __name__ == "__main__":
+    __spec__ = None
 
     print("Machine: '{}' ({} CPUs)".format(socket.gethostname(), os.cpu_count()))
 
@@ -462,22 +527,115 @@ if __name__ == "__main__":
     names = dexed_db.get_param_names()
     #print("Labels example: {}".format(dexed_db.get_preset_labels_from_file(3)))
 
-    print("numerical VSTi params: {}".format(Dexed.get_numerical_params_indexes()))
-    print("categorical VSTi params: {}".format(Dexed.get_categorical_params_indexes()))
+    # print("numerical VSTi params: {}".format(Dexed.get_numerical_params_indexes()))
+    # print("categorical VSTi params: {}".format(Dexed.get_categorical_params_indexes()))
+
+    if False:
+        # Testing using DawDreamer instead of RenderMan
+        dexed = Dexed()
+        print(dexed)
+
+        # Render note with starting params
+        print(dexed.param_desc_str())
+        audio = dexed.render_note_to_file(60, 100, 'test1.wav')
+
+        # Set paramters manually
+        dexed.set_param(4, .2)
+        dexed.set_param_by_name('MIDDLE C', .4)
+        print(dexed.param_desc_str())
+        audio = dexed.render_note_to_file(60, 127, 'test2.wav')
+
+        # Set to preset by array
+        preset_idx = 1595
+        preset_info = dexed_db.all_presets_df.iloc[preset_idx]
+        print(preset_info)
+        preset = dexed_db.get_preset_values(preset_idx)
+        dexed.set_param_array(preset)
+        audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
+        dexed.play_audio(audio, True)
+
+        preset_idx = 22112
+        preset_info = dexed_db.all_presets_df.iloc[preset_idx]
+        print(preset_info)
+        preset = dexed_db.get_preset_values(preset_idx)
+        dexed.set_param_array(preset)
+        audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
+        dexed.play_audio(audio, True)
+
+        preset_idx = 36
+        preset_info = dexed_db.all_presets_df.iloc[preset_idx]
+        print(preset_info)
+        preset = dexed_db.get_preset_values(preset_idx)
+        dexed.set_param_array(preset)
+        audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
+        dexed.play_audio(audio, True)
+
+        preset_idx = 800
+        preset_info = dexed_db.all_presets_df.iloc[preset_idx]
+        print(preset_info)
+        preset = dexed_db.get_preset_values(preset_idx)
+        dexed.set_param_array(preset)
+        audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
+        dexed.play_audio(audio, True)
+
+        # Use "plugin_format" params
+        preset_idx = 147
+        preset_info = dexed_db.all_presets_df.iloc[preset_idx]
+        print(preset_info)
+        preset = dexed_db.get_preset_values(preset_idx, plugin_format=True)
+        dexed.assign_preset(preset)
+        audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
+        dexed.play_audio(audio, True)
 
     if True:
+        # Testing methods that set defaults
+        dexed = Dexed()
+
+        dexed.set_param_by_name('MIDDLE C', .4)
+        dexed.set_param_by_name('Output', 0.0)
+        print(dexed.param_desc_str())
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        dexed.set_default_general_filter_and_tune_params()
+        print(dexed.param_desc_str())
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        print("OSC off")
+        params = dexed.get_current_params()
+        Dexed.set_all_oscillators_off_(params)
+        dexed.set_param_array(params)
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        print("OSC on")
+        dexed.set_all_oscillators_on()
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        print("S&H LFO")
+        dexed.set_param(12, 1.0)
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        print("S&H LFO to square")
+        dexed.prevent_SH_LFO()
+        dexed.play_audio(dexed.render_note(60, 127), True)
+
+        print(Dexed.get_param_cardinality(
+            Dexed.get_categorical_params_indexes()[0]
+        ))
+
+    if False:
         # ***** RE-WRITE ALL PRESETS TO SEPARATE PICKLE/TXT FILES *****
         # Approx. 360Mo (yep, the SQLite DB is much lighter...) for all params values + names + labels
         dexed_db.write_all_presets_to_files()
 
     if False:
         # Test de lecture des fichiers pickled - pas besoin de la DB lue en entier
+        # Read test pickled files - no need for the entire DB read
         preset_values = PresetDatabase.get_preset_params_values_from_file(0)
         preset_name = PresetDatabase.get_preset_name_from_file(0)
         print(preset_name)
 
     if False:
-        # Test du synth lui-même
+        # Testing the synth itself
         dexed = Dexed()
         print(dexed)
         print("Plugin params: ")
