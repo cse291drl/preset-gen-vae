@@ -124,7 +124,9 @@ class PresetDataset(torch.utils.data.Dataset, ABC):
         for midi_note_idx in midi_note_indexes:
             midi_pitch, midi_velocity = self.midi_notes[midi_note_idx]
             x_wav, _ = self.get_wav_file(preset_UID, midi_pitch, midi_velocity)
+            x_wav = np.concatenate([x_wav,np.zeros((600,),dtype=float)])
             # Spectrogram, or Mel-Spectrogram if requested (see self.spectrogram ctor arguments)
+            # x_wav = torch.rand([88200+1*600,])
             spectrogram = self.spectrogram(x_wav)
             if self.spectrogram_normalization == 'min_max':  # result in [-1, 1]
                 spectrogram = -1.0 + (spectrogram - self.spec_stats['min'])\

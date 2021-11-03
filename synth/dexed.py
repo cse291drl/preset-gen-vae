@@ -232,7 +232,7 @@ class Dexed:
             presets.
     """
 
-    def __init__(self, plugin_path=os.path.join('..', '..', 'Dexed.dll'),
+    def __init__(self, plugin_path='Dexed.dll',
                  midi_note_duration_s=3, render_duration_s=4,
                  sample_rate=22050, buffer_size=16384*8, 
                  fadeout_duration_s=0.1):
@@ -285,19 +285,19 @@ class Dexed:
         and returns the float array (possibly normalized). 
         """
         # Add note to synth
-        dexed.synth.clear_midi()
-        dexed.synth.add_midi_note(
+        self.synth.clear_midi()
+        self.synth.add_midi_note(
             midi_note, 
             midi_velocity, 
             0.0, # note start time
             self.midi_note_duration_s)
 
         # Render audio
-        dexed.engine.load_graph([(dexed.synth, [])])
-        dexed.engine.render(dexed.render_duration_s)
-        stereo_audio = dexed.engine.get_audio()
+        self.engine.load_graph([(self.synth, [])])
+        self.engine.render(self.render_duration_s)
+        stereo_audio = self.engine.get_audio()
         audio = stereo_audio.mean(axis=0)
-        dexed.synth.clear_midi()
+        self.synth.clear_midi()
 
         # Fadeout and normalize
         fadeout_len = int(np.floor(self.Fs * self.fadeout_duration_s))
@@ -530,9 +530,11 @@ if __name__ == "__main__":
     # print("numerical VSTi params: {}".format(Dexed.get_numerical_params_indexes()))
     # print("categorical VSTi params: {}".format(Dexed.get_categorical_params_indexes()))
 
-    if False:
+    if True:
         # Testing using DawDreamer instead of RenderMan
-        dexed = Dexed()
+        print("Test")
+
+        dexed = Dexed(plugin_path='Dexed.dll')
         print(dexed)
 
         # Render note with starting params
@@ -553,7 +555,7 @@ if __name__ == "__main__":
         dexed.set_param_array(preset)
         audio = dexed.render_note_to_file(60, 127, '{}.wav'.format(preset_info['name']))
         dexed.play_audio(audio, True)
-
+        print("Test2")
         preset_idx = 22112
         preset_info = dexed_db.all_presets_df.iloc[preset_idx]
         print(preset_info)
@@ -589,7 +591,7 @@ if __name__ == "__main__":
 
     if True:
         # Testing methods that set defaults
-        dexed = Dexed()
+        dexed = Dexed(plugin_path='Dexed.dll')
 
         dexed.set_param_by_name('MIDDLE C', .4)
         dexed.set_param_by_name('Output', 0.0)
@@ -622,7 +624,7 @@ if __name__ == "__main__":
             Dexed.get_categorical_params_indexes()[0]
         ))
 
-    if False:
+    if True:
         # ***** RE-WRITE ALL PRESETS TO SEPARATE PICKLE/TXT FILES *****
         # Approx. 360Mo (yep, the SQLite DB is much lighter...) for all params values + names + labels
         dexed_db.write_all_presets_to_files()

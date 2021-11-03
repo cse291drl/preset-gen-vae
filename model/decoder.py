@@ -64,10 +64,9 @@ class SpectrogramDecoder(nn.Module):
                 self.mlp = nn.Sequential(nn.Linear(self.dim_z, int(np.prod(self.cnn_input_shape))),
                                          nn.Dropout(self.fc_dropout))
             else:
-                assert NotImplementedError()
+                raise NotImplementedError()
         else:
             raise NotImplementedError("Architecture '{}' not available".format(self.architecture))
-
         # - - - - - 2) Features "un-mixer" - - - - -
         self.features_unmixer_cnn = layer.TConv2D(self.mixer_1x1conv_ch,
                                                   self.spectrogram_channels*self.last_4x4conv_ch,
@@ -77,6 +76,7 @@ class SpectrogramDecoder(nn.Module):
         # - - - - - 3) Main CNN decoder (applied once per spectrogram channel) - - - - -
         single_spec_size = list(self.spectrogram_input_size)
         single_spec_size[1] = 1
+        print(f"self.spectrogram_input_size {self.spectrogram_input_size}")
         self.single_ch_cnn = SpectrogramCNN(self.architecture, single_spec_size, append_1x1_conv=False,
                                             force_bigger_network=force_bigger_network)
 
@@ -85,6 +85,7 @@ class SpectrogramDecoder(nn.Module):
         mixed_features = mixed_features.view(-1,  # batch size auto inferred
                                              self.cnn_input_shape[0], self.cnn_input_shape[1], self.cnn_input_shape[2])
         unmixed_features = self.features_unmixer_cnn(mixed_features)
+        # unmixed_features = torch.rand([160, 1800, 3, 3])
         # This won't work on multi-channel spectrograms with force_bigger_network==True (don't do this anyway)
         single_ch_cnn_inputs = torch.split(unmixed_features, self.last_4x4conv_ch,  # actual multi-spec: 512ch-split
                                            dim=1)  # Split along channels dimension
@@ -104,7 +105,6 @@ class SpectrogramCNN(nn.Module):
             assert self.architecture == 'speccnn8l1_bn'  # Only this arch is fully-supported at the moment
         self.spectrogram_input_size = spectrogram_input_size
         assert self.spectrogram_input_size[1] == 1  # This decoder is single-channel output
-
         if self.architecture == 'wavenet_baseline':  # https://arxiv.org/abs/1704.01279
             ''' Symmetric layer output sizes (compared to the encoder).
             No activation and batch norm after the last up-conv.

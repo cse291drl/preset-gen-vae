@@ -33,6 +33,7 @@ from utils.hparams import LinearDynamicParam
 import utils.figures
 import utils.exception
 
+from tqdm import tqdm
 
 def train_config():
     """ Performs a full training run, as described by parameters in config.py.
@@ -95,7 +96,6 @@ def train_config():
     ae_model_parallel = nn.DataParallel(extended_ae_model, device_ids=parallel_device_ids, output_device=device)
     reg_model_parallel = nn.DataParallel(extended_ae_model.reg_model, device_ids=parallel_device_ids,
                                          output_device=device)
-
 
     # ========== Losses (criterion functions) ==========
     # Training losses (for backprop) and Metrics (monitoring) losses and accuracies
@@ -201,7 +201,7 @@ def train_config():
         with utils.profile.get_optional_profiler(config.train.profiler_args) as prof:
             ae_model_parallel.train()
             dataloader_iter = iter(dataloader['train'])
-            for i in range(len(dataloader['train'])):
+            for i in tqdm(range(len(dataloader['train']))):
                 with profiler.record_function("DATA_LOAD") if is_profiled else contextlib.nullcontext():
                     sample = next(dataloader_iter)
                     x_in, v_in, sample_info = sample[0].to(device), sample[1].to(device), sample[2].to(device)

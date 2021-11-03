@@ -15,11 +15,11 @@ import torch
 import torch.utils
 import soundfile
 import numpy as np
-
+import sys
+sys.path.append("..")
 from synth import dexed
 from data import abstractbasedataset  # 'from .' raises ImportError when run from PyCharm as __main__
 from data.preset import DexedPresetsParams, PresetIndexesHelper
-
 # Global lock... Should be the same for all forked Unix processes
 #dexed_vst_lock = Lock()  # Unused - pre-rendered audio (at the moment)
 
@@ -338,7 +338,7 @@ if __name__ == "__main__":
     # ============== DATA RE-GENERATION - FROM config.py ==================
     regenerate_wav = True  # multi-notes: a few minutes on a powerful CPU (20+ cores) - else: much longer
     # WARNING: when computing stats, please make sure that *all* midi notes are available
-    regenerate_spectrograms_stats = True  # approx 3 min - 30e3 preset, single MIDI note (16mins for 16 MIDI notes)
+    regenerate_spectrograms_stats = False # approx 3 min - 30e3 preset, single MIDI note (16mins for 16 MIDI notes)
     if regenerate_spectrograms_stats:
         assert len(config.model.midi_notes) > 1  # all MIDI notes (6?) must be used to compute stats
 
